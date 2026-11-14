@@ -73,6 +73,7 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="optional UDP pose listen port; 0 disables",
     )
+    parser.add_argument("--device-snapshot", type=Path)
     parser.add_argument("-Out", "--out", type=Path, help="optional ndjson event log")
     parser.add_argument(
         "-PreviewBytes",
@@ -190,6 +191,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="forward 02 25 frames even when x/y/z are all zero",
     )
+    parser.add_argument("--binding-file", type=Path, default=None,
+                        help="persist tracker serial to virtual slot bindings (requires auto-map)")
+    parser.add_argument("--binding-slot-count", type=int, default=10)
     parser.add_argument(
         "--ready-payloads",
         default="",
@@ -268,9 +272,12 @@ class EventLog:
             self._file.close()
 
 
-def tune_socket(sock: socket.socket) -> None:
+def tune_socket(sock: socket.socket, *, tracker_control: bool = False) -> None:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    if tracker_control and hasattr(socket, "SIO_KEEPALIVE_VALS"):
+        # Match TrackerOnWifi::enableTCPKeepAlive on Windows.
+        sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 4000, 1000))
 
 
 def build_slot(payload: str, slot_size: int) -> bytes:
@@ -343,9 +350,11 @@ class Scheme5ControlObserver:
             "last_tcp_port": None,
             "last_packet_class": None,
             "last_control_command": None,
+            "last_map_report": None,
             "last_tcp_connect_ns": None,
             "last_tcp_recv_ns": None,
             "last_udp_pose_ns": None,
+            "last_udp_heartbeat_ns": None,
             "tcp_keepalive_gap_ms": None,
             "last_update_ns": None,
         }
@@ -433,6 +442,10 @@ class Scheme5ControlObserver:
         families[family_key] = int(families.get(family_key, 0)) + 1
         state["tcp_control_frames_total"] = int(state["tcp_control_frames_total"]) + 1
         state["last_control_command"] = command
+        if direction == "recv" and command.startswith("MS"):
+            fields = command[2:].split(",")
+            if len(fields) == 2 and all(field.removeprefix("-").isdigit() for field in fields):
+                state["last_map_report"] = command
         state["last_update_ns"] = now_ns
         if family == "settime":
             state["settime_sent_or_observed"] = True
@@ -468,6 +481,7 @@ class Scheme5ControlObserver:
                 state["compact_udp25_packets_total"] = int(state["compact_udp25_packets_total"]) + 1
             elif packet_class == "udp_heartbeat_8":
                 state["udp_heartbeat_packets_total"] = int(state["udp_heartbeat_packets_total"]) + 1
+                state["last_udp_heartbeat_ns"] = now_ns
         if int(stats.get("frames", 0)) > 0 and packet_class is not None:
             state["udp_enabled"] = True
             state["last_udp_pose_ns"] = now_ns
@@ -497,6 +511,7 @@ class Scheme5ControlObserver:
                     "last_update_age_ms": last_update_age_ms,
                     "last_tcp_recv_age_ms": last_tcp_recv_age_ms,
                     "last_udp_pose_age_ms": last_udp_pose_age_ms,
+                    "last_udp_heartbeat_age_ms": self._age_ms(state, "last_udp_heartbeat_ns", now_ns),
                 }
             )
         return events
@@ -951,6 +966,16 @@ class PeerLatencyWindow:
         }
 
 
+BATTERY_TIMEOUT_NS = 10_000_000_000
+
+def decode_pose_battery(flags: int) -> tuple[int, bool] | None:
+    # Bit 7 marks a different peripheral report. Battery reports use 2% units.
+    percent = (flags & 0x3F) * 2
+    if flags & 0x80 or percent > 100:
+        return None
+    return percent, bool(flags & 0x40)
+
+
 class PoseForwarder:
     def __init__(
         self,
@@ -965,7 +990,29 @@ class PoseForwarder:
         paced_target_hz: float = 60.0,
         paced_backlog_collapse_ms: float = 8.0,
         forward_format: str = "json",
+        binding_file: Path | None = None,
+        binding_slot_count: int = 10,
     ) -> None:
+        self._battery_by_peer: dict[str, tuple[int, bool, int]] = {}
+        self._forwarded_peers: dict[str, tuple[int, int]] = {}
+        self._binding_file = binding_file
+        self._binding_slot_count = binding_slot_count
+        self._serials: dict[str, str] = {}
+        self._bindings: dict[str, int] = {}
+        self.initialized_controls: set[asyncio.StreamWriter] = set()
+        self.initial_syncs: dict[asyncio.StreamWriter, asyncio.StreamWriter] = {}
+        if binding_file:
+            if not auto_map_start or peer_targets or target:
+                raise ValueError("binding-file requires auto-map without explicit forwarding targets")
+            if binding_slot_count < 1 or auto_map_start[1] + binding_slot_count - 1 > 65535:
+                raise ValueError("invalid binding slot range")
+            if binding_file.exists():
+                self._bindings = json.loads(binding_file.read_text(encoding="utf-8"))
+                if (not isinstance(self._bindings, dict)
+                        or any(not isinstance(k, str) or not k or type(v) is not int
+                               or not 1 <= v <= binding_slot_count for k, v in self._bindings.items())
+                        or len(set(self._bindings.values())) != len(self._bindings)):
+                    raise ValueError("invalid or duplicate tracker bindings")
         self._target = target
         self._include_zero = include_zero
         self._peer_ip = peer_ip.strip()
@@ -997,6 +1044,23 @@ class PoseForwarder:
 
     def target_for_peer(self, peer: str) -> tuple[str, int] | None:
         peer_ip = peer.split(":", 1)[0]
+        if self._binding_file:
+            serial = self._serials.get(peer_ip)
+            if not serial:
+                return None
+            slot = self._bindings.get(serial)
+            if slot is None:
+                slot = next((i for i in range(1, self._binding_slot_count + 1)
+                             if i not in self._bindings.values()), None)
+                if slot is None:
+                    return None
+                bindings = {**self._bindings, serial: slot}
+                self._binding_file.parent.mkdir(parents=True, exist_ok=True)
+                temporary = self._binding_file.with_suffix(".tmp")
+                temporary.write_text(json.dumps(bindings, indent=2) + "\n", encoding="utf-8")
+                temporary.replace(self._binding_file)
+                self._bindings = bindings
+            return (self._auto_map_start[0], self._auto_map_start[1] + slot - 1)
         explicit_target = self._peer_targets.get(peer_ip)
         if explicit_target:
             return explicit_target
@@ -1009,6 +1073,27 @@ class PoseForwarder:
             self._auto_assignments[peer_ip] = target
             return target
         return self._target
+
+    def observe_identity(self, peer: str, data: bytes, buffer: bytearray) -> None:
+        if not self._binding_file:
+            return
+        buffer.extend(data)
+        while len(buffer) >= 2:
+            if buffer[0] != 1 or not 0 < buffer[1] <= 126:
+                del buffer[0]
+                continue
+            length = buffer[1]
+            if len(buffer) < length + 2:
+                break
+            command = bytes(buffer[2:2 + length]).decode("ascii", errors="replace")
+            del buffer[:length + 2]
+            if command.startswith("NADS") and command[4:] and all(32 <= ord(c) <= 126 for c in command):
+                ip = peer.split(":", 1)[0]
+                serial = command[4:]
+                for previous_ip in list(self._serials):
+                    if self._serials[previous_ip] == serial:
+                        del self._serials[previous_ip]
+                self._serials[ip] = serial
 
     @staticmethod
     def parse_frame_stats(frame: bytes) -> dict[str, int]:
@@ -1054,6 +1139,9 @@ class PoseForwarder:
         time_mapper.reset_for_peer(peer)
 
         for frame, source in frames:
+            battery = decode_pose_battery(frame[3]) if source in ("compact_udp25", "official_udp30") else None
+            if battery is not None:
+                self._battery_by_peer[peer] = (*battery, event_time_ns)
             stats["frames"] = int(stats["frames"]) + 1
             source_frames = stats["source_frames"]
             assert isinstance(source_frames, dict)
@@ -1144,7 +1232,7 @@ class PoseForwarder:
     @staticmethod
     def build_binary_pose_payload(payload: dict[str, object]) -> bytes:
         return struct.pack(
-            "<4sBBHHQQq13f",
+            "<4sBBHHQQq13fBB",
             b"UTKP",
             1,
             int(payload.get("seq", 0)) & 0xFF,
@@ -1166,15 +1254,23 @@ class PoseForwarder:
             float(payload.get("wx_raw", 0.0)),
             float(payload.get("wy_raw", 0.0)),
             float(payload.get("wz_raw", 0.0)),
+            int(payload.get("battery_percent", 255)),
+            int(payload.get("charging", False)),
         )
 
     def send_pose_payload(self, payload: dict[str, object], target: tuple[str, int], peer: str) -> None:
         assert self._sock is not None
+        now_ns = time.monotonic_ns()
+        battery = self.battery_status(peer, now_ns)
+        if battery is not None:
+            payload["battery_percent"], charging = battery
+            payload["charging"] = int(charging)
         if self._forward_format == "binary":
             packet = self.build_binary_pose_payload(payload)
         else:
             packet = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         self._sock.sendto(packet, target)
+        self._forwarded_peers[peer] = (target[1], now_ns)
         self.forwarded += 1
         if peer:
             self._latency_windows[peer].observe_udp_send(
@@ -1260,11 +1356,42 @@ class PoseForwarder:
             return
         self._latency_windows[peer].observe_recv(recv_time_ns, stats)
 
+    def battery_status(self, peer: str, now_ns: int) -> tuple[int, bool] | None:
+        sample = self._battery_by_peer.get(peer)
+        if sample is None or now_ns - sample[2] > BATTERY_TIMEOUT_NS:
+            return None
+        return sample[0], sample[1]
+
+    def bound_control_target(
+        self, serial: object, writers: dict[str, dict[asyncio.StreamWriter, str]],
+    ) -> tuple[str, str, asyncio.StreamWriter] | None:
+        if not isinstance(serial, str) or serial not in self._bindings:
+            return None
+        targets = [
+            (ip, peer, writer)
+            for ip, current_serial in self._serials.items()
+            if current_serial == serial
+            for writer, peer in writers.get(ip, {}).items()
+            if not writer.is_closing()
+        ]
+        return targets[0] if len(targets) == 1 else None
+
+    def identify_ip_for_port(self, port: int) -> str:
+        ips = {
+            peer.split(":", 1)[0]
+            for peer, (target_port, sent_ns) in self._forwarded_peers.items()
+            if target_port == port and peer and time.monotonic_ns() - sent_ns <= 2_000_000_000
+        }
+        return next(iter(ips)) if len(ips) == 1 else ""
+
     def latency_snapshots(self, now_ns: int, window_seconds: float) -> list[dict[str, object]]:
         snapshots = []
         for peer in sorted(self._latency_windows):
             window = self._latency_windows[peer]
-            snapshots.append(window.snapshot(peer, now_ns, window_seconds))
+            snapshot = window.snapshot(peer, now_ns, window_seconds)
+            battery = self.battery_status(peer, now_ns)
+            snapshot["battery_percent"], snapshot["charging"] = battery or (None, None)
+            snapshots.append(snapshot)
             window.reset_window()
         return snapshots
 
@@ -1353,6 +1480,36 @@ async def send_one_shot_control(
     )
 
 
+async def send_map_sync(writer, query_id: int, primary_ip: str, slot_size: int) -> None:
+    payloads = (f"ANI{query_id}", "ATM11", "pAS_TS0", "pAS_LT0", f"WI{primary_ip}", "FW1")
+    writer.write(b"".join(build_slot(payload, slot_size) for payload in payloads))
+    await writer.drain()
+
+
+async def sync_initialized_trackers(forwarder, main, writers, slot_size, log) -> None:
+    primary = forwarder.bound_control_target(main, writers)
+    if primary is None or primary[2] not in forwarder.initialized_controls:
+        return
+    for serial, slot in list(forwarder._bindings.items()):
+        if serial == main or not 1 <= slot <= 5:
+            continue
+        secondary = forwarder.bound_control_target(serial, writers)
+        if secondary is None or secondary[0] == primary[0]:
+            continue
+        ip, peer, writer = secondary
+        if writer not in forwarder.initialized_controls or forwarder.initial_syncs.get(writer) is primary[2]:
+            continue
+        forwarder.initial_syncs[writer] = primary[2]
+        try:
+            await send_map_sync(writer, slot - 1, primary[0], slot_size)
+        except OSError as exc:
+            forwarder.initial_syncs.pop(writer, None)
+            log.write({"event": "automatic_map_sync_failed", "peer": peer, "error": str(exc)})
+        else:
+            log.write({"event": "map_sync_requested", "primary": primary[0], "secondary": ip,
+                       "query_id": slot - 1, "automatic": True})
+
+
 async def handle_control_api(
     reader: asyncio.StreamReader,
     writer: asyncio.StreamWriter,
@@ -1361,6 +1518,7 @@ async def handle_control_api(
     control_observer: Scheme5ControlObserver,
     slot_size: int,
     preview_bytes: int,
+    pose_forwarder: PoseForwarder,
 ) -> None:
     try:
         raw = await asyncio.wait_for(reader.readline(), timeout=3.0)
@@ -1369,9 +1527,34 @@ async def handle_control_api(
         except (UnicodeDecodeError, json.JSONDecodeError):
             request = {}
 
+        if not isinstance(request, dict):
+            request = {}
         action = str(request.get("action", "")).strip().lower()
         ip = str(request.get("ip", "")).strip()
-        if action not in ("power_off", "apf"):
+        if action == "identify" and type(request.get("udp_port")) is int:
+            ip = pose_forwarder.identify_ip_for_port(request["udp_port"])
+        if action == "start_map_sync":
+            primary = pose_forwarder.bound_control_target(request.get("primary_serial"), active_control_writers)
+            secondary = pose_forwarder.bound_control_target(request.get("secondary_serial"), active_control_writers)
+            if primary is None or secondary is None or primary[0] == secondary[0]:
+                response = {"ok": False, "error": "requires_two_connected_bound_trackers"}
+            else:
+                query_id = pose_forwarder._bindings[request["secondary_serial"]] - 1
+                if not 0 <= query_id <= 4:
+                    response = {"ok": False, "error": "map_sync_requires_binding_slot_1_to_5"}
+                else:
+                    primary_ip, _, _ = primary
+                    secondary_ip, peer, target_writer = secondary
+                    try:
+                        await send_map_sync(target_writer, query_id, primary_ip, slot_size)
+                    except OSError:
+                        response = {"ok": False, "error": "sync_control_connection_failed"}
+                    else:
+                        log.write({"event": "map_sync_requested", "primary": primary_ip, "secondary": secondary_ip, "query_id": query_id})
+                        response = {"ok": True, "sent": [secondary_ip], "status": "requested"}
+        elif action == "identify" and (not ip or ip.lower() == "all"):
+            response = {"ok": False, "error": "no_connected_target"}
+        elif action not in ("power_off", "apf", "identify"):
             response = {"ok": False, "error": "unsupported_action"}
         else:
             targets: list[tuple[str, str, asyncio.StreamWriter]] = []
@@ -1390,7 +1573,7 @@ async def handle_control_api(
                 for target_ip, peer, target_writer in targets:
                     await send_one_shot_control(
                         target_writer,
-                        "APF",
+                        "AHT1,1,1,1" if action == "identify" else "APF",
                         slot_size,
                         log,
                         control_observer,
@@ -1413,16 +1596,30 @@ async def latency_stats_writer(
     pose_forwarder: PoseForwarder,
     control_observer: Scheme5ControlObserver,
     interval_seconds: float,
+    device_snapshot: Path | None = None,
 ) -> None:
     if interval_seconds <= 0:
         return
     while True:
         await asyncio.sleep(interval_seconds)
         now_ns = time.monotonic_ns()
-        for snapshot in pose_forwarder.latency_snapshots(now_ns, interval_seconds):
-            log.write(snapshot)
-        for snapshot in control_observer.snapshots(now_ns):
-            log.write(snapshot)
+        snapshots = pose_forwarder.latency_snapshots(now_ns, interval_seconds)
+        snapshots.extend(control_observer.snapshots(now_ns))
+        if device_snapshot:
+            wall_time_ns = time.time_ns()
+            temporary = device_snapshot.with_suffix(".tmp")
+            try:
+                temporary.write_text(
+                    "".join(json.dumps({"time_ns": wall_time_ns, **item}) + "\n" for item in snapshots),
+                    encoding="utf-8",
+                )
+                temporary.replace(device_snapshot)
+            except OSError:
+                # A reader may briefly hold the destination open on Windows.
+                pass
+        else:
+            for snapshot in snapshots:
+                log.write(snapshot)
 
 
 class PoseUdpProtocol(asyncio.DatagramProtocol):
@@ -1486,7 +1683,16 @@ async def handle_client(
     peer = f"{remote[0]}:{remote[1]}"
 
     if sock:
-        tune_socket(sock)
+        try:
+            # asyncio exposes a TransportSocket. Apply Windows TCP options through it
+            # when the raw socket is available via a duplicated handle.
+            if port == 9005 and hasattr(socket, "SIO_KEEPALIVE_VALS"):
+                with sock.dup() as control_socket:
+                    tune_socket(control_socket, tracker_control=True)
+            else:
+                tune_socket(sock)
+        except OSError as exc:
+            log.write({"event": "socket_tuning_failed", "peer": peer, "port": port, "error": str(exc)})
 
     connect_time_ns = time.monotonic_ns()
     control_observer.observe_tcp_connect(peer, port, connect_time_ns)
@@ -1513,10 +1719,19 @@ async def handle_client(
     ready_sent = False
     valid_pose_frames = 0
     pose_stream_buffer = bytearray()
+    identity_buffer = bytearray()
+    if port == 9005:
+        pose_forwarder._serials.pop(remote[0], None)
+
+    role_templates = any("{device_id}" in item or "{tracking_mode}" in item for item in ack_payloads)
 
     try:
-        if port == 9005 and ack_payloads and ack_on_connect:
-            for payload in ack_payloads:
+        if port == 9005 and role_templates and pose_forwarder._binding_file:
+            # Request identity before assigning an ID or starting tracking.
+            await send_one_shot_control(writer, "ATW", ack_slot_size, log, control_observer, peer, preview_bytes)
+        if port == 9005 and ack_payloads and ack_on_connect and not (role_templates and pose_forwarder._binding_file):
+            for template in ack_payloads:
+                payload = template.replace("{unix}", str(int(time.time()))).replace("{device_id}", "0").replace("{tracking_mode}", "21")
                 frame = build_slot(payload, ack_slot_size)
                 writer.write(frame)
                 await writer.drain()
@@ -1552,6 +1767,7 @@ async def handle_client(
             recv_time_ns = time.monotonic_ns()
             control_observer.observe_tcp_recv(peer, port, data, recv_time_ns)
             if port == 9005:
+                pose_forwarder.observe_identity(peer, data, identity_buffer)
                 pose_stats = pose_forwarder.forward_recv(recv_time_ns, peer, data, pose_stream_buffer)
                 pose_forwarder.observe_recv_stats(peer, recv_time_ns, pose_stats)
                 control_observer.observe_pose_stats(peer, pose_stats, None, recv_time_ns)
@@ -1579,7 +1795,25 @@ async def handle_client(
                         )
                     ready_sent = True
             if port == 9005 and ack_payloads and not ack_sent:
-                for payload in ack_payloads:
+                device_id, mode = 0, 21
+                if role_templates and pose_forwarder._binding_file:
+                    serial = pose_forwarder._serials.get(remote[0])
+                    if not serial or pose_forwarder.target_for_peer(peer) is None:
+                        continue
+                    device_id = pose_forwarder._bindings[serial] - 1
+                    try:
+                        main = pose_forwarder._binding_file.with_name("main_tracker.txt").read_text(encoding="utf-8-sig").strip()
+                    except FileNotFoundError:
+                        main = ""
+                    primary = pose_forwarder.bound_control_target(main, active_control_writers)
+                    if serial != main and primary and primary[2] in pose_forwarder.initialized_controls:
+                        mode = 11
+                for template in ack_payloads:
+                    if role_templates and pose_forwarder._binding_file and template == "ATW":
+                        continue
+                    payload = (template.replace("{unix}", str(int(time.time())))
+                               .replace("{device_id}", str(device_id))
+                               .replace("{tracking_mode}", str(mode)))
                     frame = build_slot(payload, ack_slot_size)
                     writer.write(frame)
                     await writer.drain()
@@ -1595,9 +1829,16 @@ async def handle_client(
                         }
                     )
                 ack_sent = True
+                if role_templates and pose_forwarder._binding_file:
+                    pose_forwarder.initialized_controls.add(writer)
+                    await sync_initialized_trackers(
+                        pose_forwarder, main, active_control_writers, ack_slot_size, log,
+                    )
     except ConnectionResetError:
         log.write({"event": "reset", "peer": peer, "port": port, "total_bytes": total})
     finally:
+        pose_forwarder.initialized_controls.discard(writer)
+        pose_forwarder.initial_syncs.pop(writer, None)
         control_observer.observe_tcp_disconnect(peer, port, time.monotonic_ns())
         if port == 9005:
             entries = active_control_writers.get(remote[0])
@@ -1629,10 +1870,12 @@ async def main_async() -> int:
         args.paced_target_hz,
         args.paced_backlog_collapse_ms,
         args.pose_forward_format,
+        args.binding_file,
+        args.binding_slot_count,
     )
     stop = asyncio.Event()
     latency_task = asyncio.create_task(
-        latency_stats_writer(log, pose_forwarder, control_observer, args.latency_stats_seconds)
+        latency_stats_writer(log, pose_forwarder, control_observer, max(1.0, args.latency_stats_seconds) if args.device_snapshot else args.latency_stats_seconds, args.device_snapshot)
     )
 
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -1725,6 +1968,7 @@ async def main_async() -> int:
                     control_observer,
                     args.ack_slot_size,
                     args.preview_bytes,
+                    pose_forwarder,
                 ),
                 "127.0.0.1",
                 args.control_api_port,

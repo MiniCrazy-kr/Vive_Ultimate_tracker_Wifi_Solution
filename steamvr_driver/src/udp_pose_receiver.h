@@ -24,6 +24,8 @@ struct UtkWifiPose
 	double wy = 0.0;
 	double wz = 0.0;
 	int pose_status = 3;
+	int battery_percent = -1;
+	bool charging = false;
 	uint8_t seq = 0;
 	uint64_t source_time_ns = 0;
 	uint64_t pc_estimated_pose_time_ns = 0;
@@ -44,6 +46,7 @@ public:
 	UtkWifiPose Latest() const;
 	bool IsRunning() const;
 	uint64_t ReceivedCount() const;
+	bool RequestIdentify( uint16_t pose_port ) const;
 
 private:
 	void ThreadMain( std::string bind_host, uint16_t port );

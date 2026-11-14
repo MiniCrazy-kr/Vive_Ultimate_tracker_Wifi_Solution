@@ -147,11 +147,12 @@ void ApplyPositionCalibration( const double in[3], double out[3] )
 }
 
 UtkWifiTrackerDevice::UtkWifiTrackerDevice(
-	UdpPoseReceiver *receiver, double stale_timeout_seconds, UtkWifiTrackerTuning tuning, std::string serial_number )
+	UdpPoseReceiver *receiver, double stale_timeout_seconds, UtkWifiTrackerTuning tuning, std::string serial_number, uint16_t pose_port )
 	: receiver_( receiver ),
 	  stale_timeout_seconds_( stale_timeout_seconds ),
 	  tuning_( tuning ),
-	  serial_number_( std::move( serial_number ) )
+	  serial_number_( std::move( serial_number ) ),
+	  pose_port_( pose_port )
 {
 }
 
@@ -171,12 +172,15 @@ vr::EVRInitError UtkWifiTrackerDevice::Activate( uint32_t object_id )
 	vr::VRProperties()->SetStringProperty(
 		container, vr::Prop_InputProfilePath_String, "{vive_ultimate_tracker}\\input\\vive_ultimate_tracker_profile.json" );
 	vr::VRProperties()->SetStringProperty( container, vr::Prop_ResourceRoot_String, "vive_ultimate_tracker" );
-	vr::VRProperties()->SetBoolProperty( container, vr::Prop_DeviceProvidesBatteryStatus_Bool, true );
-	vr::VRProperties()->SetFloatProperty( container, vr::Prop_DeviceBatteryPercentage_Float, 1.0f );
+	vr::VRProperties()->SetBoolProperty( container, vr::Prop_DeviceProvidesBatteryStatus_Bool, false );
+	vr::VRProperties()->EraseProperty( container, vr::Prop_DeviceBatteryPercentage_Float );
 	vr::VRProperties()->SetBoolProperty( container, vr::Prop_DeviceCanPowerOff_Bool, true );
 	vr::VRProperties()->SetBoolProperty( container, vr::Prop_Identifiable_Bool, true );
 	vr::VRProperties()->SetBoolProperty( container, vr::Prop_DeviceIsWireless_Bool, true );
 
+	identify_pending_ = false;
+	if ( auto *input = vr::VRDriverInput() )
+		input->CreateHapticComponent( container, "/output/haptic", &haptic_component_ );
 	pose_thread_ = std::thread( &UtkWifiTrackerDevice::PoseUpdateThread, this );
 	DriverLog( "utk_wifi_tracker: activated %s as device %u", serial_number_.c_str(), object_id );
 	return vr::VRInitError_None;
@@ -202,9 +206,18 @@ void *UtkWifiTrackerDevice::GetComponent( const char *component_name_and_version
 
 void UtkWifiTrackerDevice::DebugRequest( const char *request, char *response_buffer, uint32_t response_buffer_size )
 {
-	( void )request;
+	if ( request && ( std::strcmp( request, "identify" ) == 0 || std::strcmp( request, "IdentifyTracker" ) == 0 ) )
+		identify_pending_ = true;
 	if ( response_buffer && response_buffer_size > 0 )
 		response_buffer[0] = '\0';
+}
+
+void UtkWifiTrackerDevice::HandleEvent( const vr::VREvent_t &event )
+{
+	if ( event.eventType == vr::VREvent_Input_HapticVibration
+		 && haptic_component_ != vr::k_ulInvalidInputComponentHandle
+		 && event.data.hapticVibration.componentHandle == haptic_component_ )
+		identify_pending_ = true;
 }
 
 vr::DriverPose_t UtkWifiTrackerDevice::GetPose()
@@ -354,9 +367,19 @@ void UtkWifiTrackerDevice::PoseUpdateThread()
 {
 	uint64_t inactive_tick = 0;
 	uint64_t last_submitted_count = 0;
+	int last_battery = -1;
+	bool last_charging = false;
+	auto last_identify = std::chrono::steady_clock::now() - std::chrono::seconds( 1 );
 	while ( active_ )
 	{
 		const uint64_t received_count = receiver_ ? receiver_->ReceivedCount() : 0;
+		const auto now = std::chrono::steady_clock::now();
+		if ( identify_pending_.exchange( false ) && receiver_ && now - last_identify >= std::chrono::seconds( 1 ) )
+		{
+			last_identify = now;
+			if ( !receiver_->RequestIdentify( pose_port_ ) )
+				DriverLog( "utk_wifi_tracker: could not send identify request on pose port %u", static_cast<unsigned>( pose_port_ ) );
+		}
 		const bool has_ever_received_pose = received_count > 0;
 		const bool has_new_pose = received_count != last_submitted_count;
 		const bool submit_inactive_heartbeat = !has_ever_received_pose && ( inactive_tick++ % 20 == 0 );
@@ -364,6 +387,28 @@ void UtkWifiTrackerDevice::PoseUpdateThread()
 		if ( device_index_ != vr::k_unTrackedDeviceIndexInvalid
 			 && ( has_new_pose || submit_pose_heartbeat || submit_inactive_heartbeat ) )
 		{
+			const UtkWifiPose latest = receiver_ ? receiver_->Latest() : UtkWifiPose{};
+			const int battery = has_ever_received_pose && now - latest.received_at <= std::chrono::seconds( 2 )
+				? latest.battery_percent : -1;
+			const bool charging = battery >= 0 && latest.charging;
+			if ( battery != last_battery || charging != last_charging )
+			{
+				auto *properties = vr::VRProperties();
+				const auto container = properties->TrackedDeviceToPropertyContainer( device_index_ );
+				if ( battery >= 0 )
+				{
+					properties->SetFloatProperty( container, vr::Prop_DeviceBatteryPercentage_Float, battery / 100.0f );
+					properties->SetBoolProperty( container, vr::Prop_DeviceIsCharging_Bool, charging );
+				}
+				else
+				{
+					properties->EraseProperty( container, vr::Prop_DeviceBatteryPercentage_Float );
+					properties->EraseProperty( container, vr::Prop_DeviceIsCharging_Bool );
+				}
+				properties->SetBoolProperty( container, vr::Prop_DeviceProvidesBatteryStatus_Bool, battery >= 0 );
+				last_battery = battery;
+				last_charging = charging;
+			}
 			vr::VRServerDriverHost()->TrackedDevicePoseUpdated( device_index_, GetPose(), sizeof( vr::DriverPose_t ) );
 			last_submitted_count = received_count;
 		}

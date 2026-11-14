@@ -191,7 +191,7 @@ vr::EVRInitError UtkWifiDeviceProvider::Init( vr::IVRDriverContext *driver_conte
 
 		char serial[32] = {};
 		std::snprintf( serial, sizeof( serial ), "UTK_WIFI_%04d", static_cast<int>( index + 1 ) );
-		auto tracker = std::make_unique<UtkWifiTrackerDevice>( receiver.get(), stale_timeout_seconds, tuning, serial );
+		auto tracker = std::make_unique<UtkWifiTrackerDevice>( receiver.get(), stale_timeout_seconds, tuning, serial, port );
 		if ( !vr::VRServerDriverHost()->TrackedDeviceAdded(
 				 tracker->SerialNumber().c_str(), vr::TrackedDeviceClass_GenericTracker, tracker.get() ) )
 		{
@@ -225,6 +225,8 @@ void UtkWifiDeviceProvider::RunFrame()
 	vr::VREvent_t event{};
 	while ( vr::VRServerDriverHost()->PollNextEvent( &event, sizeof( event ) ) )
 	{
+		for ( const auto &tracker : trackers_ )
+			tracker->HandleEvent( event );
 	}
 }
 

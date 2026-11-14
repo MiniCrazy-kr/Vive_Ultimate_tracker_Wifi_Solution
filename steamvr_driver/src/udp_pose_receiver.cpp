@@ -186,6 +186,29 @@ void UdpPoseReceiver::ThreadMain( std::string bind_host, uint16_t port )
 	CloseSocket( socket_handle );
 }
 
+bool UdpPoseReceiver::RequestIdentify( uint16_t pose_port ) const
+{
+	if ( !running_ )
+		return false;
+	const SocketHandle control = socket( AF_INET, SOCK_STREAM, IPPROTO_TCP );
+	if ( control == kInvalidSocket )
+		return false;
+
+	sockaddr_in endpoint{};
+	endpoint.sin_family = AF_INET;
+	endpoint.sin_addr.s_addr = htonl( INADDR_LOOPBACK );
+	endpoint.sin_port = htons( 19005 );
+	bool sent = false;
+	if ( connect( control, reinterpret_cast<const sockaddr *>( &endpoint ), sizeof( endpoint ) ) == 0 )
+	{
+		const auto request = "{\"action\":\"identify\",\"udp_port\":" + std::to_string( pose_port ) + "}\n";
+		const int length = static_cast<int>( request.size() );
+		sent = send( control, request.data(), length, 0 ) == length;
+	}
+	CloseSocket( control );
+	return sent;
+}
+
 bool UdpPoseReceiver::ParsePosePacket( const char *data, size_t size, UtkWifiPose *pose )
 {
 	if ( !data || !pose )
@@ -249,6 +272,13 @@ bool UdpPoseReceiver::ParsePoseBinary( const char *data, size_t size, UtkWifiPos
 	pose->wx = values[10];
 	pose->wy = values[11];
 	pose->wz = values[12];
+	uint8_t battery = 255;
+	uint8_t charging = 0;
+	if ( ReadPod( data, size, &offset, &battery ) && ReadPod( data, size, &offset, &charging ) && battery <= 100 )
+	{
+		pose->battery_percent = battery;
+		pose->charging = charging == 1;
+	}
 	return true;
 }
 
@@ -272,6 +302,14 @@ bool UdpPoseReceiver::ParsePoseJson( const std::string &json, UtkWifiPose *pose 
 	ExtractDoubleNeedle( json, "\"wy_raw\":", &pose->wy );
 	ExtractDoubleNeedle( json, "\"wz_raw\":", &pose->wz );
 	ExtractIntNeedle( json, "\"pose_status\":", &pose->pose_status );
+	int battery = -1;
+	int charging = 0;
+	if ( ExtractIntNeedle( json, "\"battery_percent\":", &battery ) && battery >= 0 && battery <= 100 )
+	{
+		pose->battery_percent = battery;
+		ExtractIntNeedle( json, "\"charging\":", &charging );
+		pose->charging = charging == 1;
+	}
 	int seq = 0;
 	if ( ExtractIntNeedle( json, "\"seq\":", &seq ) )
 		pose->seq = static_cast<uint8_t>( seq & 0xff );

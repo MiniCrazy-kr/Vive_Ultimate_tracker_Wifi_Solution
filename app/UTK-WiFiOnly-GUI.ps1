@@ -108,8 +108,9 @@ function Start-AppProcess {
     Start-Process -FilePath "powershell.exe" -ArgumentList $argumentText -WindowStyle $style | Out-Null
 }
 
-function Get-TrackerDevices {
-    $output = @(& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $appScript -Action DevicesTsv 2>$null)
+function ConvertFrom-TrackerDevicesTsv {
+    param([string]$Text)
+    $output = @($Text -split '\r?\n')
     if (-not $output -or $output.Count -lt 2) {
         return @()
     }
@@ -130,25 +131,46 @@ function Get-TrackerDevices {
     return $items
 }
 
-function Invoke-TrackerPowerOff {
-    param([string]$Ip = "all")
+function Compare-TrackerDeviceSortValue {
+    param([string]$Column, [string]$Left, [string]$Right)
+    if ($Column -eq "IP") {
+        $leftIp = $null
+        $rightIp = $null
+        if ([version]::TryParse($Left, [ref]$leftIp) -and [version]::TryParse($Right, [ref]$rightIp)) {
+            return $leftIp.CompareTo($rightIp)
+        }
+    } elseif ($Column -in @("SteamVRUdpPort", "TcpPort")) {
+        $leftPort = 0
+        $rightPort = 0
+        [void][int]::TryParse($Left, [ref]$leftPort)
+        [void][int]::TryParse($Right, [ref]$rightPort)
+        return $leftPort.CompareTo($rightPort)
+    }
+    return [string]::Compare($Left, $Right, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Invoke-TrackerControl {
+    param([string]$Ip, [ValidateSet("power_off", "identify", "start_map_sync")][string]$Action = "power_off",
+        [string]$PrimarySerial, [string]$SecondarySerial)
 
     $client = $null
     try {
         $client = New-Object System.Net.Sockets.TcpClient
         $connect = $client.BeginConnect("127.0.0.1", 19005, $null, $null)
         if (-not $connect.AsyncWaitHandle.WaitOne(1200)) {
-            throw "Control API is not available. Restart Start Service once to enable remote power control."
+            throw "Control API is not available. Restart Start Service once to enable tracker controls."
         }
         $client.EndConnect($connect)
         $stream = $client.GetStream()
+        $stream.ReadTimeout = 1500
+        $stream.WriteTimeout = 1500
         $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
         $writer = New-Object System.IO.StreamWriter($stream, $utf8NoBom)
         $writer.NewLine = "`n"
         $writer.AutoFlush = $true
         $reader = New-Object System.IO.StreamReader($stream, $utf8NoBom)
         $target = if ([string]::IsNullOrWhiteSpace($Ip)) { "all" } else { $Ip }
-        $payload = @{ action = "power_off"; ip = $target } | ConvertTo-Json -Compress
+        $payload = @{ action = $Action; ip = $target; primary_serial = $PrimarySerial; secondary_serial = $SecondarySerial } | ConvertTo-Json -Compress
         $writer.WriteLine($payload)
         $line = $reader.ReadLine()
         if (-not $line) {
@@ -156,9 +178,11 @@ function Invoke-TrackerPowerOff {
         }
         $response = $line | ConvertFrom-Json
         if (-not $response.ok) {
-            throw "Power command failed: $($response.error)"
+            throw "Tracker command failed: $($response.error)"
         }
-        return "Power off sent to: $(@($response.sent) -join ', ')"
+        if ($Action -eq "start_map_sync") { return "Map sync requested for $SecondarySerial." }
+        $label = if ($Action -eq "identify") { "Identify" } else { "Power off" }
+        return "$label sent to: $(@($response.sent) -join ', ')"
     } finally {
         if ($client) {
             $client.Close()
@@ -204,9 +228,42 @@ function Show-DevicesWindow {
     $grid.EnableHeadersVisualStyles = $false
     $grid.ColumnHeadersDefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(232, 237, 244)
     $grid.ColumnHeadersDefaultCellStyle.ForeColor = [System.Drawing.Color]::FromArgb(35, 42, 52)
-    foreach ($column in @("IP", "PeerPort", "TcpPort", "SteamVRUdpPort", "State", "TrackerSN", "DeviceSN", "Firmware", "LastPoseAgeMs", "PoseStatus")) {
+    foreach ($column in @("IP", "PeerPort", "TcpPort", "SteamVRUdpPort", "TrackingStatus", "TrackerSN", "DeviceSN", "Firmware", "LastPoseAgeMs", "PoseStatus", "Battery", "MapReport")) {
         [void]$grid.Columns.Add($column, $column)
     }
+    $grid.Columns["TrackingStatus"].HeaderText = "Tracking"
+    $grid.Columns["TrackingStatus"].FillWeight = 90
+    $grid.Columns["TrackerSN"].FillWeight = 155
+    $grid.Columns["DeviceSN"].FillWeight = 145
+    $grid.Columns["IP"].FillWeight = 125
+    $grid.Columns["SteamVRUdpPort"].HeaderText = "SteamVR"
+    $grid.Columns["LastPoseAgeMs"].HeaderText = "Pose age (ms)"
+    $sortState = @{
+        Column = "IP"
+        Direction = [System.ComponentModel.ListSortDirection]::Ascending
+    }
+    $grid.Columns["IP"].HeaderCell.SortGlyphDirection = [System.Windows.Forms.SortOrder]::Ascending
+    $grid.Add_SortCompare({
+        param($sender, $eventArgs)
+        $result = Compare-TrackerDeviceSortValue -Column $eventArgs.Column.Name -Left $eventArgs.CellValue1 -Right $eventArgs.CellValue2
+        if ($result -eq 0 -and $eventArgs.Column.Name -ne "IP") {
+            $leftIp = $sender.Rows[$eventArgs.RowIndex1].Cells["IP"].Value
+            $rightIp = $sender.Rows[$eventArgs.RowIndex2].Cells["IP"].Value
+            $result = Compare-TrackerDeviceSortValue -Column "IP" -Left $leftIp -Right $rightIp
+        }
+        $eventArgs.SortResult = $result
+        $eventArgs.Handled = $true
+    })
+    $grid.Add_Sorted({
+        if ($grid.SortedColumn -and $grid.SortOrder -ne [System.Windows.Forms.SortOrder]::None) {
+            $sortState.Column = $grid.SortedColumn.Name
+            $sortState.Direction = if ($grid.SortOrder -eq [System.Windows.Forms.SortOrder]::Descending) {
+                [System.ComponentModel.ListSortDirection]::Descending
+            } else {
+                [System.ComponentModel.ListSortDirection]::Ascending
+            }
+        }
+    })
     $devicesForm.Controls.Add($grid)
 
     $sidePanel = New-Object System.Windows.Forms.Panel
@@ -237,12 +294,55 @@ function Show-DevicesWindow {
     $powerOneButton.Size = New-Object System.Drawing.Size(180, 34)
     $sidePanel.Controls.Add($powerOneButton)
 
-    $sideNote = New-Object System.Windows.Forms.Label
-    $sideNote.Text = "This sends APF once through the running keepalive service."
-    $sideNote.Location = New-Object System.Drawing.Point(14, 154)
-    $sideNote.Size = New-Object System.Drawing.Size(180, 70)
-    $sideNote.ForeColor = [System.Drawing.Color]::FromArgb(94, 103, 115)
-    $sidePanel.Controls.Add($sideNote)
+    $identifyButton = New-Object System.Windows.Forms.Button
+    $identifyButton.Text = "$([char]::ConvertFromUtf32(0x1F50D)) Identify Selected"
+    $identifyButton.Location = New-Object System.Drawing.Point(14, 154)
+    $identifyButton.Size = New-Object System.Drawing.Size(180, 34)
+    $sidePanel.Controls.Add($identifyButton)
+    $syncCheck = New-Object System.Windows.Forms.CheckBox
+    $syncCheck.Text = "Sync with main tracker"
+    $syncCheck.Location = New-Object System.Drawing.Point(14, 194)
+    $syncCheck.Size = New-Object System.Drawing.Size(180, 24)
+    $sidePanel.Controls.Add($syncCheck)
+
+    $syncButton = New-Object System.Windows.Forms.Button
+    $syncButton.Text = "Sync Selected"
+    $syncButton.Location = New-Object System.Drawing.Point(14, 224)
+    $syncButton.Size = New-Object System.Drawing.Size(180, 34)
+    $syncButton.Enabled = $false
+    $sidePanel.Controls.Add($syncButton)
+    $syncCheck.Add_CheckedChanged({ $syncButton.Enabled = $syncCheck.Checked })
+    $resetButton = New-Object System.Windows.Forms.Button
+    $resetButton.Text = "Factory Reset (USB)"
+    $resetButton.Location = New-Object System.Drawing.Point(14, 264)
+    $resetButton.Size = New-Object System.Drawing.Size(180, 34)
+    $sidePanel.Controls.Add($resetButton)
+    $resetButton.Add_Click({
+        if ($grid.SelectedRows.Count -ne 1) {
+            $statusLabel.Text = "Select one tracker first."
+            return
+        }
+        $serial = ([string]$grid.SelectedRows[0].Cells["TrackerSN"].Value).TrimStart([char]0x2605, [char]32).Trim()
+        if (-not $serial) {
+            $statusLabel.Text = "The selected tracker has no reported serial."
+            return
+        }
+        $answer = [System.Windows.Forms.MessageBox]::Show(
+            $devicesForm, "Factory reset $serial? This may erase saved tracker settings and maps.",
+            "Factory Reset (USB)", "YesNo", "Warning", "Button2")
+        if ($answer -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+        try {
+            if (-not ("UtkUsbReset" -as [type])) {
+                Add-Type -Path (Join-Path $PSScriptRoot "UTK-UsbReset.cs") -ErrorAction Stop
+            }
+            [UtkUsbReset]::Reset($serial)
+            $statusLabel.Text = "Factory reset command sent to $serial."
+        } catch {
+            $statusLabel.Text = $_.Exception.GetBaseException().Message
+        }
+    })
+
+
 
     $refreshButton = New-Object System.Windows.Forms.Button
     $refreshButton.Text = "Refresh"
@@ -288,40 +388,182 @@ function Show-DevicesWindow {
         }
     }
 
-    function Refresh-DeviceGrid {
-        try {
-            $rows = @(Get-TrackerDevices)
-            $grid.Rows.Clear()
-            foreach ($row in $rows) {
-                $rowIndex = $grid.Rows.Add()
-                $values = @(
-                    [string]$row.IP,
-                    [string]$row.PeerPort,
-                    [string]$row.TcpPort,
-                    [string]$row.SteamVRUdpPort,
-                    [string]$row.State,
-                    [string]$row.TrackerSN,
-                    [string]$row.DeviceSN,
-                    [string]$row.Firmware,
-                    [string]$row.LastPoseAgeMs,
-                    [string]$row.PoseStatus
-                )
-                for ($i = 0; $i -lt $values.Count; $i++) {
-                    $grid.Rows[$rowIndex].Cells[$i].Value = $values[$i]
+    # The worker returns TSV. Only WinForms timer callbacks read or update controls.
+    $refreshState = @{ Process = $null; Output = $null; Errors = $null; Deadline = $null }
+    $completionTimer = New-Object System.Windows.Forms.Timer
+    $completionTimer.Interval = 100
+
+    function Stop-DeviceQuery {
+        $completionTimer.Stop()
+        if ($refreshState.Process) {
+            try {
+                if (-not $refreshState.Process.HasExited) {
+                    $refreshState.Process.Kill()
                 }
+            } catch [System.InvalidOperationException] {
+                # The process can exit between HasExited and Kill.
+            } finally {
+                $refreshState.Process.Dispose()
+                $refreshState.Process = $null
+                $refreshState.Output = $null
+                $refreshState.Errors = $null
             }
-            if ($grid.Rows.Count -gt 0) {
-                $grid.Rows[0].Selected = $true
-            }
-            Update-SelectedLabel
-            $statusLabel.Text = "Found $($rows.Count) tracker device(s). Last refresh: $(Get-Date -Format 'HH:mm:ss')"
+        }
+        $refreshButton.Enabled = $true
+    }
+
+    function Start-DeviceRefresh {
+        param([switch]$Manual)
+        if ($Manual) {
+            $refreshButton.Enabled = $false
+            $statusLabel.Text = "Refreshing tracker list..."
+        }
+        if ($refreshState.Process) {
+            return
+        }
+
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo.FileName = "powershell.exe"
+        $process.StartInfo.Arguments = '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "{0}" -Action DevicesTsv' -f $appScript
+        $process.StartInfo.UseShellExecute = $false
+        $process.StartInfo.CreateNoWindow = $true
+        $process.StartInfo.RedirectStandardOutput = $true
+        $process.StartInfo.RedirectStandardError = $true
+        try {
+            [void]$process.Start()
+            $refreshState.Process = $process
+            $refreshState.Output = $process.StandardOutput.ReadToEndAsync()
+            $refreshState.Errors = $process.StandardError.ReadToEndAsync()
+            $refreshState.Deadline = [DateTime]::UtcNow.AddSeconds(15)
+            $completionTimer.Start()
         } catch {
+            if ($refreshState.Process) { Stop-DeviceQuery } else { $process.Dispose() }
+            $refreshButton.Enabled = $true
             $statusLabel.Text = "Refresh failed: $($_.Exception.Message)"
         }
     }
 
-    $refreshButton.Add_Click({ Refresh-DeviceGrid })
+    function Update-DeviceGrid {
+        param([object[]]$Rows)
+        $selectedIp = Get-SelectedTrackerIp
+        $mainSerial = if (Test-Path -LiteralPath $mainTrackerPath) {
+            [string](Get-Content -LiteralPath $mainTrackerPath -TotalCount 1 -ErrorAction SilentlyContinue)
+        }
+        $existing = @{}
+        foreach ($gridRow in $grid.Rows) {
+            $existing[[string]$gridRow.Cells["IP"].Value] = $gridRow
+        }
+        $sortNeeded = $false
+        foreach ($row in $rows) {
+            $key = [string]$row.IP
+            if ($existing.ContainsKey($key)) {
+                $gridRow = $existing[$key]
+                $existing.Remove($key)
+            } else {
+                $gridRow = $grid.Rows[$grid.Rows.Add()]
+                $sortNeeded = $true
+            }
+            $values = @(
+                [string]$row.IP,
+                [string]$row.PeerPort,
+                [string]$row.TcpPort,
+                [string]$row.SteamVRUdpPort,
+                [string]$row.TrackingStatus,
+                $(if ($mainSerial -and $row.TrackerSN -eq $mainSerial) {
+                    "$([char]0x2605) $($row.TrackerSN)"
+                } else { [string]$row.TrackerSN }),
+                [string]$row.DeviceSN,
+                [string]$row.Firmware,
+                [string]$row.LastPoseAgeMs,
+                [string]$row.PoseStatus,
+                [string]$row.Battery,
+                [string]$row.MapReport
+            )
+            for ($i = 0; $i -lt $values.Count; $i++) {
+                $cell = $gridRow.Cells[$i]
+                if ([string]$cell.Value -cne $values[$i]) {
+                    $cell.Value = $values[$i]
+                    if ($grid.Columns[$i].Name -eq $sortState.Column) { $sortNeeded = $true }
+                }
+            }
+            $statusCell = $gridRow.Cells["TrackingStatus"]
+            $statusColor = switch ($row.TrackingStatus) {
+                "Tracking" { [System.Drawing.Color]::DarkGreen }
+                "Tracking lost" { [System.Drawing.Color]::DarkRed }
+                "Offline" { [System.Drawing.Color]::DimGray }
+                default { [System.Drawing.Color]::SaddleBrown }
+            }
+            if ($statusCell.Style.ForeColor -ne $statusColor) { $statusCell.Style.ForeColor = $statusColor }
+        }
+        foreach ($obsolete in $existing.Values) { $grid.Rows.Remove($obsolete) }
+        if ($grid.Rows.Count -gt 0 -and $sortNeeded) {
+            $grid.Sort($grid.Columns[$sortState.Column], $sortState.Direction)
+        }
+        if ($grid.Rows.Count -gt 0 -and (Get-SelectedTrackerIp) -ne $selectedIp -or
+            $grid.Rows.Count -gt 0 -and -not $selectedIp) {
+            $selectedRow = $grid.Rows | Where-Object { $_.Cells["IP"].Value -eq $selectedIp } | Select-Object -First 1
+            $grid.ClearSelection()
+            if ($selectedRow) {
+                $selectedRow.Selected = $true
+            } elseif (-not $selectedIp) {
+                $grid.Rows[0].Selected = $true
+            }
+        }
+        Update-SelectedLabel
+        $statusLabel.Text = "Found $($rows.Count) tracker device(s). Last refresh: $(Get-Date -Format 'HH:mm:ss')"
+    }
+
+    $completionTimer.Add_Tick({
+        try {
+            if (-not ($refreshState.Process.HasExited -and $refreshState.Output.IsCompleted -and $refreshState.Errors.IsCompleted)) {
+                if ([DateTime]::UtcNow -lt $refreshState.Deadline) { return }
+                throw "Tracker query timed out."
+            }
+            if ($refreshState.Process.ExitCode -ne 0) {
+                $message = $refreshState.Errors.GetAwaiter().GetResult().Trim()
+                if (-not $message) { $message = "Tracker query exited with code $($refreshState.Process.ExitCode)." }
+                throw $message
+            }
+            $rows = @(ConvertFrom-TrackerDevicesTsv -Text $refreshState.Output.GetAwaiter().GetResult())
+            Update-DeviceGrid -Rows $rows
+        } catch {
+            $statusLabel.Text = "Refresh failed: $($_.Exception.Message)"
+        }
+        Stop-DeviceQuery
+    })
+    $refreshButton.Add_Click({ Start-DeviceRefresh -Manual })
     $grid.Add_SelectionChanged({ Update-SelectedLabel })
+    $syncButton.Add_Click({
+        if (-not $syncCheck.Checked -or $grid.SelectedRows.Count -ne 1) {
+            $statusLabel.Text = "Select one secondary tracker."
+            return
+        }
+        try {
+            $primary = if (Test-Path -LiteralPath $mainTrackerPath) {
+                ([string](Get-Content -LiteralPath $mainTrackerPath -TotalCount 1 -ErrorAction Stop)).Trim()
+            }
+            if (-not $primary) {
+                $statusLabel.Text = "Set the main tracker in Tracker Bindings first."
+                return
+            }
+            $secondary = ([string]$grid.SelectedRows[0].Cells["TrackerSN"].Value).TrimStart([char]0x2605, [char]32).Trim()
+            $statusLabel.Text = Invoke-TrackerControl -Action start_map_sync -PrimarySerial $primary -SecondarySerial $secondary
+        } catch {
+            $statusLabel.Text = $_.Exception.Message
+        }
+    })
+    $identifyButton.Add_Click({
+        $ip = Get-SelectedTrackerIp
+        if (-not $ip) {
+            $statusLabel.Text = "Select a tracker first."
+            return
+        }
+        try {
+            $statusLabel.Text = Invoke-TrackerControl -Ip $ip -Action identify
+        } catch {
+            $statusLabel.Text = $_.Exception.Message
+        }
+    })
     $powerOneButton.Add_Click({
         $ip = Get-SelectedTrackerIp
         if (-not $ip) {
@@ -333,9 +575,8 @@ function Show-DevicesWindow {
             return
         }
         try {
-            $statusLabel.Text = Invoke-TrackerPowerOff -Ip $ip
-            Start-Sleep -Milliseconds 200
-            Refresh-DeviceGrid
+            $statusLabel.Text = Invoke-TrackerControl -Ip $ip
+            Start-DeviceRefresh
         } catch {
             $statusLabel.Text = $_.Exception.Message
         }
@@ -346,16 +587,27 @@ function Show-DevicesWindow {
             return
         }
         try {
-            $statusLabel.Text = Invoke-TrackerPowerOff -Ip "all"
-            Start-Sleep -Milliseconds 200
-            Refresh-DeviceGrid
+            $statusLabel.Text = Invoke-TrackerControl -Ip "all"
+            Start-DeviceRefresh
         } catch {
             $statusLabel.Text = $_.Exception.Message
         }
     })
     $closeDevicesButton.Add_Click({ $devicesForm.Close() })
-    Refresh-DeviceGrid
-    [void]$devicesForm.ShowDialog($form)
+    $refreshTimer = New-Object System.Windows.Forms.Timer
+    $refreshTimer.Interval = 3000
+    $refreshTimer.Add_Tick({ Start-DeviceRefresh })
+    Start-DeviceRefresh
+    try {
+        $refreshTimer.Start()
+        $workArea = [System.Windows.Forms.Screen]::FromControl($form).WorkingArea
+        $devicesForm.Size = New-Object System.Drawing.Size([Math]::Min(1220, $workArea.Width), [Math]::Min(560, $workArea.Height))
+        [void]$devicesForm.ShowDialog($form)
+    } finally {
+        $refreshTimer.Dispose()
+        Stop-DeviceQuery
+        $completionTimer.Dispose()
+    }
 }
 
 $form = New-Object System.Windows.Forms.Form
@@ -424,6 +676,12 @@ $initButton.Location = New-Object System.Drawing.Point(350, 140)
 $initButton.Size = New-Object System.Drawing.Size(110, 28)
 $form.Controls.Add($initButton)
 
+$bindingsButton = New-Object System.Windows.Forms.Button
+$bindingsButton.Text = "Tracker Bindings"
+$bindingsButton.Location = New-Object System.Drawing.Point(470, 140)
+$bindingsButton.Size = New-Object System.Drawing.Size(140, 28)
+$form.Controls.Add($bindingsButton)
+
 $steamvrCheck = New-Object System.Windows.Forms.CheckBox
 $steamvrCheck.Text = "Auto-register SteamVR driver"
 $steamvrCheck.Checked = $true
@@ -454,18 +712,85 @@ $form.Controls.Add($trackerLabel)
 $trackerCountBox = New-Object System.Windows.Forms.NumericUpDown
 $trackerCountBox.Minimum = 1
 $trackerCountBox.Maximum = 16
-$trackerCountBox.Value = 10
+$trackerCountBox.Value = 5
 $trackerCountBox.Location = New-Object System.Drawing.Point(160, 246)
 $trackerCountBox.Size = New-Object System.Drawing.Size(80, 24)
 $form.Controls.Add($trackerCountBox)
+
+$bindingModeBox = New-Object System.Windows.Forms.ComboBox
+$bindingModeBox.DropDownStyle = "DropDownList"
+$bindingModeBox.Location = New-Object System.Drawing.Point(260, 246)
+$bindingModeBox.Size = New-Object System.Drawing.Size(396, 24)
+[void]$bindingModeBox.Items.Add("Fixed binding (tracker serial)")
+[void]$bindingModeBox.Items.Add("Legacy binding (arrival order)")
+$bindingModeBox.SelectedIndex = 0
+$stateDir = Join-Path (Split-Path -Parent $PSScriptRoot) "backups\utk_wifi_only_app"
+$bindingStatePath = Join-Path $stateDir "keepalive_process.json"
+$bindingPath = Join-Path $stateDir "tracker_bindings.json"
+$mainTrackerPath = Join-Path $stateDir "main_tracker.txt"
+if (Test-Path -LiteralPath $bindingStatePath) {
+    try {
+        $bindingState = Get-Content -LiteralPath $bindingStatePath -Raw | ConvertFrom-Json
+        if ($bindingState.binding_mode -eq "Legacy") { $bindingModeBox.SelectedIndex = 1 }
+    } catch { }
+}
+$form.Controls.Add($bindingModeBox)
+$bindingModeBox.Add_SelectedIndexChanged({
+    $statusBox.Text = "Binding mode applies on next service start. Click Stop, then Start Service. Saved fixed bindings are retained in Legacy mode."
+})
+
+$frequencyLabel = New-Object System.Windows.Forms.Label
+$frequencyLabel.Text = "Power / Pose Rate"
+$frequencyLabel.Location = New-Object System.Drawing.Point(24, 279)
+$frequencyLabel.Size = New-Object System.Drawing.Size(130, 24)
+$form.Controls.Add($frequencyLabel)
+
+$frequencyBox = New-Object System.Windows.Forms.ComboBox
+$frequencyBox.DropDownStyle = "DropDownList"
+$frequencyBox.Location = New-Object System.Drawing.Point(160, 277)
+$frequencyBox.Size = New-Object System.Drawing.Size(100, 24)
+[void]$frequencyBox.Items.Add("50 Hz")
+[void]$frequencyBox.Items.Add("60 Hz")
+$frequencyBox.SelectedIndex = if ($bindingState.power_frequency_hz -eq 60) { 1 } else { 0 }
+$form.Controls.Add($frequencyBox)
+$frequencyBox.Add_SelectedIndexChanged({
+    $statusBox.Text = "Power frequency and pose rate apply on next service start. Click Stop, then Start Service."
+})
+
+$trackingDelayLabel = New-Object System.Windows.Forms.Label
+$trackingDelayLabel.Text = "Tracking lost delay (ms)"
+$trackingDelayLabel.Location = New-Object System.Drawing.Point(280, 279)
+$trackingDelayLabel.Size = New-Object System.Drawing.Size(160, 24)
+$form.Controls.Add($trackingDelayLabel)
+
+$trackingDelayBox = New-Object System.Windows.Forms.NumericUpDown
+$trackingDelayBox.Location = New-Object System.Drawing.Point(447, 277)
+$trackingDelayBox.Size = New-Object System.Drawing.Size(90, 24)
+$trackingDelayBox.Minimum = 50
+$trackingDelayBox.Maximum = 2000
+$trackingDelayBox.Increment = 50
+$trackingDelayBox.Value = if ($bindingState.tracking_lost_delay_ms -ge 50 -and $bindingState.tracking_lost_delay_ms -le 2000) {
+    [int]$bindingState.tracking_lost_delay_ms
+} else { 200 }
+$form.Controls.Add($trackingDelayBox)
+$trackingDelayBox.Add_ValueChanged({
+    $statusBox.Text = "To apply the tracking lost delay, restart the service and then SteamVR."
+})
+
+$serviceLogCheck = New-Object System.Windows.Forms.CheckBox
+$serviceLogCheck.Text = "Save logs"
+$serviceLogCheck.Checked = $bindingState.service_logging -ne $false
+$serviceLogCheck.Location = New-Object System.Drawing.Point(548, 277)
+$serviceLogCheck.Size = New-Object System.Drawing.Size(108, 24)
+$form.Controls.Add($serviceLogCheck)
 
 $statusBox = New-Object System.Windows.Forms.TextBox
 $statusBox.Multiline = $true
 $statusBox.ReadOnly = $true
 $statusBox.ScrollBars = "Vertical"
-$statusBox.Location = New-Object System.Drawing.Point(24, 290)
+$statusBox.Location = New-Object System.Drawing.Point(24, 315)
 $statusBox.Size = New-Object System.Drawing.Size(632, 82)
-$statusBox.Text = "Normal mode starts compact UDP with ACK-on-connect and paced 50 Hz binary UTKP. Periodic ATM21 refresh is disabled because it can trigger lost-tracking flashes."
+$statusBox.Text = "Normal mode starts compact UDP with ACK-on-connect and binary UTKP paced at the selected rate. Periodic ATM21 refresh is disabled because it can trigger lost-tracking flashes."
 $form.Controls.Add($statusBox)
 
 $serviceButton = New-Object System.Windows.Forms.Button
@@ -524,15 +849,96 @@ $initButton.Add_Click({
     }
 })
 
+$bindingsButton.Add_Click({
+    try {
+        $state = if (Test-Path -LiteralPath $bindingStatePath) {
+            Get-Content -LiteralPath $bindingStatePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        }
+        $basePort = $null
+        if ($state.binding_mode -eq "Fixed" -and $state.pose_forward_auto_map -match ':(\d+)$') {
+            $basePort = [int]$Matches[1]
+        }
+        $bindings = if (Test-Path -LiteralPath $bindingPath) {
+            Get-Content -LiteralPath $bindingPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        }
+        $mainSerial = if (Test-Path -LiteralPath $mainTrackerPath) {
+            [string](Get-Content -LiteralPath $mainTrackerPath -TotalCount 1 -ErrorAction Stop)
+        }
+        $entries = if ($bindings) { $bindings.PSObject.Properties | Sort-Object { [int]$_.Value }, Name }
+        $rows = if ($bindings) {
+            foreach ($entry in $entries) {
+                $slot = [int]$entry.Value
+                [pscustomobject]@{
+                    Slot = $slot
+                    TrackerSN = if ($entry.Name -eq $mainSerial) { "$([char]0x2605) $($entry.Name)" } else { $entry.Name }
+                    SteamVRUdpPort = if ($null -ne $basePort) { $basePort + $slot - 1 } else { "-" }
+                }
+            }
+        }
+        $mode = if ($state.binding_mode) { $state.binding_mode } else { "Unknown" }
+        $body = if ($rows) {
+            ($rows | Format-Table -AutoSize | Out-String -Width 120).TrimEnd()
+        } else {
+            "No saved tracker bindings."
+        }
+        $dialog = New-Object System.Windows.Forms.Form
+        $dialog.Text = "Tracker Bindings"
+        $dialog.StartPosition = "CenterParent"
+        $dialog.ClientSize = New-Object System.Drawing.Size(480, 300)
+        try {
+            $view = New-Object System.Windows.Forms.TextBox
+            $view.Dock = "Fill"
+            $view.Multiline = $true
+            $view.ReadOnly = $true
+            $view.WordWrap = $false
+            $view.ScrollBars = "Both"
+            $view.Font = New-Object System.Drawing.Font("Consolas", 10)
+            $view.Text = "Last recorded service mode: $mode" + [Environment]::NewLine + "Saved fixed slots" + [Environment]::NewLine + $body
+            $dialog.Controls.Add($view)
+            $mainSelector = New-Object System.Windows.Forms.ComboBox
+            $mainSelector.Dock = "Top"
+            $mainSelector.DropDownStyle = "DropDownList"
+            [void]$mainSelector.Items.Add("No main tracker")
+            foreach ($entry in $entries) { [void]$mainSelector.Items.Add($entry.Name) }
+            $selected = if ([string]::IsNullOrWhiteSpace($mainSerial)) { 0 } else {
+                $mainSelector.Items.IndexOf($mainSerial.Trim())
+            }
+            $mainSelector.SelectedIndex = [Math]::Max(0, $selected)
+            $saveMainButton = New-Object System.Windows.Forms.Button
+            $saveMainButton.Dock = "Bottom"
+            $saveMainButton.Text = "Save main tracker (local selection)"
+            $saveMainButton.Add_Click({
+                try {
+                    $serial = if ($mainSelector.SelectedIndex -gt 0) { [string]$mainSelector.SelectedItem } else { "" }
+                    Set-Content -LiteralPath $mainTrackerPath -Value $serial -Encoding ASCII -ErrorAction Stop
+                    $dialog.Close()
+                } catch {
+                    [void][System.Windows.Forms.MessageBox]::Show($dialog, $_.Exception.Message, "Tracker Bindings")
+                }
+            })
+            $dialog.Controls.Add($mainSelector)
+            $dialog.Controls.Add($saveMainButton)
+            [void]$dialog.ShowDialog($form)
+        } finally {
+            $dialog.Dispose()
+        }
+    } catch {
+        [void][System.Windows.Forms.MessageBox]::Show($form, $_.Exception.Message, "Tracker Bindings")
+    }
+})
+
 $serviceButton.Add_Click({
+    $frequencyHz = if ($frequencyBox.SelectedIndex -eq 1) { "60" } else { "50" }
     $argsList = @(
         "-Action", "StartKeepalive",
         "-TrackerCount", ([string][int]$trackerCountBox.Value),
+        "-BindingMode", $(if ($bindingModeBox.SelectedIndex -eq 0) { "Fixed" } else { "Legacy" }),
         "-StopViveTrackerServer",
         "-UdpPosePort", "9005",
         "-AckOnConnect:`$true",
         "-ForwardBurstMode", "paced",
-        "-PacedTargetHz", "50",
+        "-PowerFrequencyHz", $frequencyHz,
+        "-TrackingLostDelayMs", [string]$trackingDelayBox.Value,
         "-PacedMaxDelayMs", "45",
         "-PoseForwardFormat", "binary",
         "-PoseForwardIncludeZero:`$true",
@@ -547,6 +953,7 @@ $serviceButton.Add_Click({
     if ($firewallCheck.Checked) {
         $argsList += "-EnsureFirewallRule"
     }
+    if (-not $serviceLogCheck.Checked) { $argsList += "-NoServiceLogs" }
     if ($debugModeCheck.Checked) {
         $argsList += @(
             "-Realtime:`$false",
@@ -560,9 +967,9 @@ $serviceButton.Add_Click({
 
     Start-AppProcess -ExtraArgs $argsList -Visible
     if ($debugModeCheck.Checked) {
-        $statusBox.Text = "Debug service start requested. This is heavier and intended for captures."
+        $statusBox.Text = "Debug service start requested at $frequencyHz Hz power frequency. Pose packets are forwarded without pacing for captures."
     } else {
-        $statusBox.Text = "Normal service start requested without periodic ATM21 refresh. Keep this running first, then let the tracker connect to WiFi."
+        $statusBox.Text = "Normal service start requested at $frequencyHz Hz power frequency and pose rate. Keep this running first, then let the tracker connect to WiFi."
     }
 })
 

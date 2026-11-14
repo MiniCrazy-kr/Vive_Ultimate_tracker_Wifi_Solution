@@ -7,7 +7,8 @@ param(
     [string]$Password = "",
     [string]$ServerIp = "Auto",
     [int]$PosePort = 0,
-    [string]$CountryCode = "CN",
+    [string]$CountryCode = "KR",
+    [switch]$NoServiceLogs,
     [string]$Frequency = "0",
     [string]$Proto = "udp",
 
@@ -18,8 +19,11 @@ param(
     [switch]$StopViveTrackerServer,
     [int]$PreviewBytes = 4096,
     [double]$IdlePingSeconds = 0,
-    [string]$AckPayloads = "ANI0,ATW,ACF50,ATS{unix},WcCN,FW2,pAS_TS0,pAS_LT0,ATM21",
+    [string]$AckPayloads = "ANI{device_id},ATW,ACF50,ATS{unix},Wc{country},FW2,ATM{tracking_mode},pAS_TS0,pAS_LT0",
     [object]$AckOnConnect = $true,
+    [ValidateSet("50", "60")]
+    [int]$PowerFrequencyHz = 50,
+    [ValidateRange(50, 2000)][int]$TrackingLostDelayMs = 200,
     [int]$AckSlotSize = 128,
     [int]$ConsoleRecvLimit = -1,
     [switch]$FullPayloadHex,
@@ -36,6 +40,8 @@ param(
     [string]$PoseForwardPeerIp = "",
     [string]$PoseForwardMap = "",
     [string]$PoseForwardAutoMap = "",
+    [ValidateSet("Fixed", "Legacy")]
+    [string]$BindingMode = "Fixed",
     [object]$PoseForwardIncludeZero = $true,
     [string]$ReadyPayloads = "",
     [int]$ReadyAfterValidFrames = 30,
@@ -48,7 +54,7 @@ param(
     [object]$AutoRegisterSteamVR = $true,
     [object]$BuildSteamVRDriverIfMissing = $true,
     [int]$UdpStartPort = 5557,
-    [int]$TrackerCount = 10
+    [int]$TrackerCount =10
 )
 
 $ErrorActionPreference = "Stop"
@@ -81,6 +87,15 @@ $PoseForwardIncludeZero = Convert-ToBoolean -Value $PoseForwardIncludeZero -Defa
 $AutoPoseForward = Convert-ToBoolean -Value $AutoPoseForward -Default $true
 $AutoRegisterSteamVR = Convert-ToBoolean -Value $AutoRegisterSteamVR -Default $true
 $BuildSteamVRDriverIfMissing = Convert-ToBoolean -Value $BuildSteamVRDriverIfMissing -Default $true
+
+if ($PSBoundParameters.ContainsKey("PowerFrequencyHz")) {
+    if (-not $PSBoundParameters.ContainsKey("AckPayloads")) {
+        $AckPayloads = $AckPayloads.Replace("ACF50", "ACF$PowerFrequencyHz")
+    }
+    if (-not $PSBoundParameters.ContainsKey("PacedTargetHz")) {
+        $PacedTargetHz = $PowerFrequencyHz
+    }
+}
 
 $appDir = $PSScriptRoot
 $rootDir = Split-Path -Parent $appDir
@@ -241,6 +256,7 @@ function Write-SteamVRDriverSettings {
                 udp_bind_host = "127.0.0.1"
                 udp_port = $StartPort
                 tracker_count = $count
+                valid_pose_max_age_seconds = $TrackingLostDelayMs / 1000.0
                 stale_timeout_seconds = 2.0
             }
             foreach ($entry in $desired.GetEnumerator()) {
@@ -357,7 +373,7 @@ function Get-CurrentKeepaliveProcessInfo {
         AutoMap = $null
     }
     $commandLine = [string]$process.CommandLine
-    if ($commandLine -match '--out\s+("([^"]+)"|(\S+))') {
+    if ($commandLine -match '--(?:out|device-snapshot)\s+("([^"]+)"|(\S+))') {
         $info.Out = if ($matches[2]) { $matches[2] } else { $matches[3] }
     }
     if ($commandLine -match '--pose-forward-auto-map\s+("([^"]+)"|(\S+))') {
@@ -407,9 +423,12 @@ function Get-TrackerDeviceRows {
                 DeviceSN = ""
                 Hardware = ""
                 Firmware = ""
-                LastPoseAgeMs = $null
                 LastRecvAgeMs = $null
                 PoseStatus = ""
+                TrackingStatus = "Waiting for pose"
+                MapReport = ""
+                Battery = "Unknown"
+                LastPoseEventTime = 0
                 LastCommand = ""
             }
             [void]$peerOrder.Add($ip)
@@ -468,10 +487,15 @@ function Get-TrackerDeviceRows {
                     $device.TcpLocalPort = [int]$event.last_tcp_port
                 }
                 if ($event.readiness_phase) { $device.State = [string]$event.readiness_phase }
-                if ($null -ne $event.last_udp_pose_age_ms) { $device.LastPoseAgeMs = [double]$event.last_udp_pose_age_ms }
                 if ($null -ne $event.last_tcp_recv_age_ms) { $device.LastRecvAgeMs = [double]$event.last_tcp_recv_age_ms }
                 if ($event.last_control_command) { $device.LastCommand = [string]$event.last_control_command }
                 if ($hasControlCommands) {
+                    # The observer records the last command separately from cumulative command counts.
+                    if ($event.tcp_connected -and $event.last_map_report) {
+                        $device.MapReport = [string]$event.last_map_report
+                    } elseif ($event.tcp_connected -and $event.last_control_command -match '^MS-?\d+,-?\d+$') {
+                        $device.MapReport = [string]$event.last_control_command
+                    }
                     foreach ($property in $event.tcp_control_commands.PSObject.Properties) {
                         $name = $property.Name
                         if ($name -match '^recv:NADS(.+)$') { $device.TrackerSN = $matches[1] }
@@ -481,13 +505,30 @@ function Get-TrackerDeviceRows {
                     }
                 }
             } elseif ($event.event -eq "latency_stats") {
-                if ($null -ne $event.last_recv_age_ms) { $device.LastPoseAgeMs = [double]$event.last_recv_age_ms }
-                if ($event.pose_status_counts) {
-                    $pairs = @()
-                    foreach ($property in $event.pose_status_counts.PSObject.Properties) {
-                        $pairs += "$($property.Name):$($property.Value)"
+                $poseTime = [long]$event.time_ns - [long]([double]$event.last_recv_age_ms * 1000000)
+                if ([int]$event.frame_count -gt 0 -and $poseTime -ge $device.LastPoseEventTime) {
+                    $device.LastPoseEventTime = $poseTime
+                    $pairs = foreach ($property in $event.pose_status_counts.PSObject.Properties) {
+                        "$($property.Name):$($property.Value)"
                     }
                     $device.PoseStatus = $pairs -join ","
+                    $tracked = [int]$event.pose_status_counts.'0x02'
+                    $lost = [int]$event.pose_status_counts.'0x03'
+                    $status4 = [int]$event.pose_status_counts.'0x04'
+                    $device.TrackingStatus = if ($tracked -gt 0 -and $lost -gt 0) {
+                        "Intermittent"
+                    } elseif ($tracked -gt 0) {
+                        "Tracking"
+                    } elseif ($status4 -gt 0) {
+                        "Tracking uncertain"
+                    } elseif ($lost -gt 0) {
+                        "Tracking lost"
+                    } else {
+                        "Unknown pose"
+                    }
+                    $device.Battery = if ($null -eq $event.battery_percent) { "Unknown" } elseif ($event.charging) {
+                        "$($event.battery_percent)% (Charging)"
+                    } else { "$($event.battery_percent)%" }
                 }
                 if ([int]$event.valid_frame_count -gt 0) {
                     $device.State = "udp_pose_active"
@@ -496,32 +537,56 @@ function Get-TrackerDeviceRows {
         }
     }
 
-    $index = 0
+    $savedBindings = $null
+    $bindingPath = Join-Path $stateDir "tracker_bindings.json"
+    $useFixedBindings = $state -and $state.binding_mode -eq "Fixed"
+    if ($useFixedBindings -and (Test-Path -LiteralPath $bindingPath)) {
+        $savedBindings = Get-Content -LiteralPath $bindingPath -Raw | ConvertFrom-Json
+    }
     $activeIps = if ($onlineIps.Count -gt 0) { @($peerOrder | Where-Object { $onlineIps.Contains($_) }) } else { @($peerOrder) }
-    $rows = foreach ($ip in $activeIps) {
+    $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $rows = foreach ($ip in $peerOrder) {
         $device = $devices[$ip]
+        $poseAgeMs = if ($device.LastPoseEventTime -gt 0) {
+            [Math]::Max(0, [Math]::Round($nowMs - ($device.LastPoseEventTime / 1000000)))
+        }
+        $hasRecentPose = $null -ne $poseAgeMs -and $poseAgeMs -le 3000
         if ($onlineIps.Contains($ip) -and ($device.State -ne "udp_pose_active")) {
             $device.State = "tcp_established"
-            if ($null -eq $device.LastPoseAgeMs) {
-                $device.LastPoseAgeMs = 0
-            }
         }
         if ($autoMapStartPort -ne $null) {
-            $device.SteamVRUdpPort = $autoMapStartPort + $index
+            $device.SteamVRUdpPort = $null
+            if (-not $useFixedBindings) {
+                $slotIndex = [array]::IndexOf(@($activeIps), $ip)
+                if ($slotIndex -ge 0) { $device.SteamVRUdpPort = $autoMapStartPort + $slotIndex }
+            } elseif ($savedBindings -and $device.TrackerSN) {
+                $binding = $savedBindings.PSObject.Properties[$device.TrackerSN]
+                if ($binding) { $device.SteamVRUdpPort = $autoMapStartPort + [int]$binding.Value - 1 }
+            }
         }
-        $index += 1
         [pscustomobject]@{
             IP = $device.IP
             PeerPort = if ($onlinePeerPorts.ContainsKey($ip)) { (($onlinePeerPorts[$ip] | Sort-Object) -join ",") } else { (($device.PeerPorts | Sort-Object) -join ",") }
             TcpPort = $device.TcpLocalPort
             SteamVRUdpPort = $device.SteamVRUdpPort
             State = $device.State
+            MapReport = $device.MapReport
+            TrackingStatus = if ($hasRecentPose) {
+                $device.TrackingStatus
+            } elseif ($onlineIps.Contains($ip)) {
+                "Waiting for pose"
+            } else {
+                "Offline"
+            }
             TrackerSN = $device.TrackerSN
             DeviceSN = $device.DeviceSN
             Hardware = $device.Hardware
             Firmware = $device.Firmware
-            LastPoseAgeMs = $device.LastPoseAgeMs
+            LastPoseAgeMs = $poseAgeMs
             LastRecvAgeMs = $device.LastRecvAgeMs
+            Battery = if ($hasRecentPose) {
+                $device.Battery
+            } else { "Unknown" }
             PoseStatus = $device.PoseStatus
             LastCommand = $device.LastCommand
         }
@@ -705,9 +770,7 @@ function Start-Keepalive {
         $argsList += "-StopViveTrackerServer"
     }
     if ($AckPayloads) {
-        $effectiveAckPayloads = $AckPayloads.Replace("{unix}", [string][int][double]::Parse((Get-Date -UFormat %s)))
-        $argsList += @("-AckPayloads", $AckPayloads)
-        $argsList[-1] = $effectiveAckPayloads
+        $argsList += @("-AckPayloads", $AckPayloads.Replace("{country}", $CountryCode.Trim().ToUpperInvariant()))
     }
     if ($AckOnConnect) {
         $argsList += "-AckOnConnect"
@@ -735,6 +798,9 @@ function Start-Keepalive {
     }
     if ($effectivePoseForwardAutoMap) {
         $argsList += @("-PoseForwardAutoMap", $effectivePoseForwardAutoMap)
+        if ($BindingMode -eq "Fixed" -and -not $PoseForwardMap -and -not $PoseForwardUdp) {
+            $argsList += @("-BindingFile", (Join-Path $stateDir "tracker_bindings.json"), "-BindingSlotCount", "$TrackerCount")
+        }
     }
     if ($PoseForwardIncludeZero) {
         $argsList += "-PoseForwardIncludeZero"
@@ -756,14 +822,28 @@ function Start-Keepalive {
     Write-Host "Stdout:     $stdout"
     Write-Host "Stderr:     $stderr"
 
-    $process = Start-Process -FilePath $ps -ArgumentList (Join-ProcessArguments -Arguments $argsList) -RedirectStandardOutput $stdout -RedirectStandardError $stderr -WindowStyle Hidden -PassThru
+    $redirect = @{}
+    if ($NoServiceLogs) {
+        $snapshot = Join-Path $stateDir "device-status.ndjson"
+        $argsList += @("-DeviceSnapshot", $snapshot)
+        Remove-Item -LiteralPath $snapshot -ErrorAction SilentlyContinue
+        $stdout = $null
+        $stderr = $null
+    } else {
+        $redirect = @{ RedirectStandardOutput = $stdout; RedirectStandardError = $stderr }
+    }
+    $process = Start-Process -FilePath $ps -ArgumentList (Join-ProcessArguments -Arguments $argsList) -WindowStyle Hidden -PassThru @redirect
     $state = [ordered]@{
         pid = $process.Id
         started = (Get-Date).ToString("s")
+        service_logging = -not $NoServiceLogs
         stdout = $stdout
         stderr = $stderr
         ports = $Ports
         pose_forward_auto_map = $effectivePoseForwardAutoMap
+        binding_mode = $BindingMode
+        power_frequency_hz = $PowerFrequencyHz
+        tracking_lost_delay_ms = $TrackingLostDelayMs
         control_refresh_payloads = $ControlRefreshPayloads
         control_refresh_seconds = $ControlRefreshSeconds
         control_refresh_start_delay_seconds = $ControlRefreshStartDelaySeconds
@@ -851,7 +931,7 @@ switch ($Action) {
         @(Get-TrackerDeviceRows) | ConvertTo-Json -Depth 5
     }
     "DevicesTsv" {
-        $columns = @("IP", "PeerPort", "TcpPort", "SteamVRUdpPort", "State", "TrackerSN", "DeviceSN", "Firmware", "LastPoseAgeMs", "PoseStatus")
+        $columns = @("IP", "PeerPort", "TcpPort", "SteamVRUdpPort", "State", "TrackerSN", "DeviceSN", "Firmware", "LastPoseAgeMs", "PoseStatus", "Battery", "TrackingStatus", "MapReport")
         $columns -join "`t"
         foreach ($row in @(Get-TrackerDeviceRows)) {
             $values = foreach ($column in $columns) {

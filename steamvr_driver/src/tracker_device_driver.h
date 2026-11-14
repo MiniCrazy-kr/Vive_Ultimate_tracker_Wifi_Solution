@@ -34,7 +34,7 @@ struct UtkWifiTrackerTuning
 	bool status4_requires_motion = true;
 	double status4_motion_epsilon_mps = 0.050;
 	double status4_position_epsilon_m = 0.002;
-	double valid_pose_max_age_seconds = 0.100;
+	double valid_pose_max_age_seconds = 0.200;
 	double estimated_pose_time_max_age_seconds = 0.050;
 	double pose_time_offset_min_seconds = -0.02;
 	double pose_time_offset_max_seconds = 0.05;
@@ -52,7 +52,7 @@ class UtkWifiTrackerDevice : public vr::ITrackedDeviceServerDriver
 {
 public:
 	UtkWifiTrackerDevice(
-		UdpPoseReceiver *receiver, double stale_timeout_seconds, UtkWifiTrackerTuning tuning, std::string serial_number );
+		UdpPoseReceiver *receiver, double stale_timeout_seconds, UtkWifiTrackerTuning tuning, std::string serial_number, uint16_t pose_port );
 
 	vr::EVRInitError Activate( uint32_t object_id ) override;
 	void Deactivate() override;
@@ -62,6 +62,7 @@ public:
 	vr::DriverPose_t GetPose() override;
 
 	const std::string &SerialNumber() const;
+	void HandleEvent( const vr::VREvent_t &event );
 
 private:
 	void PoseUpdateThread();
@@ -80,6 +81,9 @@ private:
 	std::thread pose_thread_;
 	vr::TrackedDeviceIndex_t device_index_ = vr::k_unTrackedDeviceIndexInvalid;
 	std::string serial_number_;
+	uint16_t pose_port_;
+	vr::VRInputComponentHandle_t haptic_component_ = vr::k_ulInvalidInputComponentHandle;
+	std::atomic<bool> identify_pending_{ false };
 	bool has_reported_pose_state_ = false;
 	bool last_pose_valid_ = false;
 	bool tracking_valid_ = false;

@@ -3,6 +3,7 @@ param(
     [string]$Ports = "9005,3680,8053,15680",
     [int]$UdpPosePort = 0,
     [string]$OutDir = "",
+    [string]$DeviceSnapshot = "",
     [string]$Python = "",
     [switch]$StopViveTrackerServer,
     [int]$PreviewBytes = 64,
@@ -25,6 +26,8 @@ param(
     [string]$PoseForwardPeerIp = "",
     [string]$PoseForwardMap = "",
     [string]$PoseForwardAutoMap = "",
+    [string]$BindingFile = "",
+    [int]$BindingSlotCount = 10,
     [switch]$PoseForwardIncludeZero,
     [string]$ReadyPayloads = "",
     [int]$ReadyAfterValidFrames = 30,
@@ -70,7 +73,7 @@ Write-Host "Ports: $Ports"
 if ($UdpPosePort -gt 0) {
     Write-Host "UDP pose input port: $UdpPosePort"
 }
-Write-Host "Log: $out"
+if (-not $DeviceSnapshot) { Write-Host "Log: $out" }
 if ($AckPayloads) {
     Write-Host "ACK payloads: $AckPayloads"
     if ($AckOnConnect) {
@@ -128,7 +131,6 @@ $argsList = @(
     "--bind", $Bind,
     "--ports", $Ports,
     "--udp-pose-port", $UdpPosePort,
-    "--out", $out,
     "--preview-bytes", $PreviewBytes,
     "--idle-ping-seconds", $IdlePingSeconds,
     "--ack-slot-size", $AckSlotSize,
@@ -139,6 +141,11 @@ $argsList = @(
     "--paced-backlog-collapse-ms", $PacedBacklogCollapseMs,
     "--pose-forward-format", $PoseForwardFormat
 )
+if ($DeviceSnapshot) {
+    $argsList += @("--device-snapshot", $DeviceSnapshot)
+} else {
+    $argsList += @("--out", $out)
+}
 
 if ($AckPayloads) {
     $argsList += "--ack-payloads"
@@ -175,6 +182,9 @@ if ($PoseForwardMap) {
 if ($PoseForwardAutoMap) {
     $argsList += "--pose-forward-auto-map"
     $argsList += $PoseForwardAutoMap
+}
+if ($BindingFile) {
+    $argsList += @("--binding-file", $BindingFile, "--binding-slot-count", "$BindingSlotCount")
 }
 if ($PoseForwardIncludeZero) {
     $argsList += "--pose-forward-include-zero"

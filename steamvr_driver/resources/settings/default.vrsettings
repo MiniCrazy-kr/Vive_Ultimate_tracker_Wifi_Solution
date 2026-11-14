@@ -3,7 +3,7 @@
                                     "enable":  true,
                                     "udp_bind_host":  "127.0.0.1",
                                     "udp_port":  5557,
-                                    "tracker_count":  10,
+                                    "tracker_count":  5,
                                     "stale_timeout_seconds":  2,
                                     "prediction_enabled":  false,
                                     "smoothing_enabled":  true,
@@ -28,7 +28,7 @@
                                     "status4_requires_motion":  true,
                                     "status4_motion_epsilon_mps":  0.05,
                                     "status4_position_epsilon_m":  0.002,
-                                    "valid_pose_max_age_seconds":  0.10,
+                                    "valid_pose_max_age_seconds":  0.2,
                                     "estimated_pose_time_max_age_seconds":  0.05,
                                     "pose_time_offset_min_seconds":  -0.02,
                                     "pose_time_offset_max_seconds":  0.05
