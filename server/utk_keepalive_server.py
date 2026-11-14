@@ -999,7 +999,8 @@ class PoseForwarder:
         self._binding_slot_count = binding_slot_count
         self._serials: dict[str, str] = {}
         self._bindings: dict[str, int] = {}
-        self.initialized_controls: set[asyncio.StreamWriter] = set()
+        self.latest_pose: dict[str, tuple[int, bool]] = {}
+        self.initialized_controls: dict[asyncio.StreamWriter, int] = {}
         self.initial_syncs: dict[asyncio.StreamWriter, asyncio.StreamWriter] = {}
         if binding_file:
             if not auto_map_start or peer_targets or target:
@@ -1147,6 +1148,10 @@ class PoseForwarder:
             assert isinstance(source_frames, dict)
             source_frames[source] = int(source_frames.get(source, 0)) + 1
             frame_stats = self.parse_frame_stats(frame)
+            if self._binding_file:
+                self.latest_pose[peer_ip] = (
+                    event_time_ns, frame_stats["pose_status"] == 2 and bool(frame_stats["valid_frames"]),
+                )
             stats["valid_frames"] = int(stats["valid_frames"]) + frame_stats["valid_frames"]
             stats["invalid_frames"] = int(stats["invalid_frames"]) + frame_stats["invalid_frames"]
             for stats_key, value_key in (
@@ -1499,6 +1504,25 @@ async def sync_initialized_trackers(forwarder, main, writers, slot_size, log) ->
         ip, peer, writer = secondary
         if writer not in forwarder.initialized_controls or forwarder.initial_syncs.get(writer) is primary[2]:
             continue
+        if primary[2].is_closing():
+            return
+        if forwarder.initialized_controls[writer] == 21:
+            try:
+                writer.write(b"".join(build_slot(command, slot_size)
+                                      for command in ("ATM11", "pAS_TS0", "pAS_LT0")))
+                await writer.drain()
+            except OSError as exc:
+                log.write({"event": "automatic_secondary_mode_failed", "peer": peer, "error": str(exc)})
+                continue
+            if writer not in forwarder.initialized_controls:
+                continue
+            forwarder.initialized_controls[writer] = 11
+            log.write({"event": "automatic_secondary_wait", "peer": peer})
+        if primary[2].is_closing():
+            return
+        pose_time, tracking = forwarder.latest_pose.get(primary[0], (0, False))
+        if not tracking or time.monotonic_ns() - pose_time > 1_000_000_000:
+            continue
         forwarder.initial_syncs[writer] = primary[2]
         try:
             await send_map_sync(writer, slot - 1, primary[0], slot_size)
@@ -1508,6 +1532,17 @@ async def sync_initialized_trackers(forwarder, main, writers, slot_size, log) ->
         else:
             log.write({"event": "map_sync_requested", "primary": primary[0], "secondary": ip,
                        "query_id": slot - 1, "automatic": True})
+
+
+async def automatic_map_sync_loop(forwarder, writers, slot_size, log) -> None:
+    main_path = forwarder._binding_file.with_name("main_tracker.txt")
+    while True:
+        await asyncio.sleep(0.25)
+        try:
+            main = main_path.read_text(encoding="utf-8-sig").strip()
+        except (OSError, UnicodeError):
+            continue
+        await sync_initialized_trackers(forwarder, main, writers, slot_size, log)
 
 
 async def handle_control_api(
@@ -1722,6 +1757,7 @@ async def handle_client(
     identity_buffer = bytearray()
     if port == 9005:
         pose_forwarder._serials.pop(remote[0], None)
+        pose_forwarder.latest_pose.pop(remote[0], None)
 
     role_templates = any("{device_id}" in item or "{tracking_mode}" in item for item in ack_payloads)
 
@@ -1830,14 +1866,11 @@ async def handle_client(
                     )
                 ack_sent = True
                 if role_templates and pose_forwarder._binding_file:
-                    pose_forwarder.initialized_controls.add(writer)
-                    await sync_initialized_trackers(
-                        pose_forwarder, main, active_control_writers, ack_slot_size, log,
-                    )
+                    pose_forwarder.initialized_controls[writer] = mode
     except ConnectionResetError:
         log.write({"event": "reset", "peer": peer, "port": port, "total_bytes": total})
     finally:
-        pose_forwarder.initialized_controls.discard(writer)
+        pose_forwarder.initialized_controls.pop(writer, None)
         pose_forwarder.initial_syncs.pop(writer, None)
         control_observer.observe_tcp_disconnect(peer, port, time.monotonic_ns())
         if port == 9005:
@@ -1873,6 +1906,11 @@ async def main_async() -> int:
         args.binding_file,
         args.binding_slot_count,
     )
+    auto_sync_task = None
+    if args.binding_file and any(token in args.ack_payloads for token in ("{device_id}", "{tracking_mode}")):
+        auto_sync_task = asyncio.create_task(
+            automatic_map_sync_loop(pose_forwarder, active_control_writers, args.ack_slot_size, log)
+        )
     stop = asyncio.Event()
     latency_task = asyncio.create_task(
         latency_stats_writer(log, pose_forwarder, control_observer, max(1.0, args.latency_stats_seconds) if args.device_snapshot else args.latency_stats_seconds, args.device_snapshot)
@@ -1992,6 +2030,9 @@ async def main_async() -> int:
                     "skipped_burst": pose_forwarder.skipped_burst,
                 }
             )
+        if auto_sync_task is not None:
+            auto_sync_task.cancel()
+            await asyncio.gather(auto_sync_task, return_exceptions=True)
         latency_task.cancel()
         try:
             await latency_task
